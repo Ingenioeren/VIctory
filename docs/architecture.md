@@ -97,3 +97,36 @@ the lanes take, from structurisation), and accessed with a non-uniform heap
 index in one pass. `victory translate`
 runs every shader it finds (containers, SGD5 files) through these and
 lists what they cannot handle yet.
+
+The [DXIL emitter](../crates/victory-shader/src/emit/mod.rs) lowers that
+program to a Shader Model 6.6 container and records the bindings the host
+needs. Compute shaders that depend on the console's lane layout declare
+its wave size, which the host device must support. The
+[shader cache](../crates/victory-gpu/src/shader_cache.rs) keys translations
+by the shader bytes and the VIctory build, so changing the translator
+invalidates earlier entries.
+
+## Host GPU submission
+
+The [host GPU](../crates/victory-gpu/src/host.rs) uses one D3D12 device
+and a direct queue. [Command submission](../crates/victory-gpu/src/queue.rs)
+waits for that queue to finish each submission. Draws and dispatches use
+[host pipelines](../crates/victory-gpu/src/pipeline/host.rs) built from the
+title's state and translated shaders, with host root signatures derived
+from the shader bindings. [Pipeline creation workers](../crates/victory-gpu/src/pipeline/make.rs)
+compile these pipelines. Once the wait budget for the title frame is
+spent, a draw or dispatch whose pipeline is still compiling is dropped.
+
+[Buffer shadows](../crates/victory-gpu/src/shadow.rs) copy the known input
+ranges that have changed from title memory. After the submission completes,
+ranges written by the GPU are copied back. [Texture uploads](../crates/victory-gpu/src/texture.rs)
+detile changed title texture data into a staging buffer before uploading
+it to the host texture. The buffer and texture paths currently have
+limited refresh coverage for directly indexed descriptors.
+
+## Presentation
+
+The [display API](../crates/victory-hle/src/modules/display.rs) reports HDR
+as disabled while the [host swap chain](../crates/victory-gpu/src/host.rs)
+presents SDR. HDR support needs an HDR-capable swap chain before the API
+can report HDR mode and the display's luminance.
