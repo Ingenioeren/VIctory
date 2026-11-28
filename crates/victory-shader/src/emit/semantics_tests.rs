@@ -2814,6 +2814,93 @@ fn scalar_alu_matches_the_hardware() {
     assert_clean(check(&passing(scalar_probes())));
 }
 
+/// All signed halfwords at every effective shift, then high-half selection,
+/// ignored count bits, overlapping destinations and inactive lanes.
+#[test]
+fn i16_right_shift_matches_signed_division() {
+    let model = |i: [u32; 4], dst: u8, opsel: u8, guarded: bool| {
+        let old = match dst {
+            1 => i[0],
+            2 => i[1],
+            _ => i[3],
+        };
+        if guarded && i[2] == 0 {
+            return vec![old];
+        }
+        let count = (i[0] >> (16 * u32::from(opsel & 1))) & 15;
+        let word = (i[1] >> (16 * u32::from(opsel >> 1 & 1))) as u16;
+        // Floor division in a wider signed type, independent of arithmetic
+        // shifting and the emitter's sign-extension operations.
+        let quotient = i64::from(word as i16).div_euclid(1i64 << count) as u16;
+        let at = 16 * u32::from(opsel >> 3 & 1);
+        vec![(old & !(0xFFFF << at)) | u32::from(quotient) << at]
+    };
+    let exhaustive: Vec<_> = (0..=u16::MAX)
+        .flat_map(|word| {
+            (0..16u32).map(move |count| {
+                [
+                    count | 0xABCD_FFF0,
+                    0xA55A_0000 | u32::from(word),
+                    1,
+                    0x1234_5678,
+                ]
+            })
+        })
+        .collect();
+    let mut probes = vec![probe(
+        vop3(0x308, 5, [v(1), v(2), 0], NONE),
+        exhaustive,
+        INT,
+        move |i| model(i, 5, 0, false),
+    )];
+    let edges = [0, 1, 15, 16, 31, 0x7FFF, 0x8000, 0x8001, 0xFFF0, 0xFFFF];
+    let mut inputs = Vec::new();
+    for low in edges {
+        for high in edges {
+            for count in 0..16u32 {
+                for ignored in [0, 0xFFFF_FFF0] {
+                    let counts =
+                        (count | ignored).rotate_left(16) | (15 - count) | (ignored & 0xFFF0);
+                    inputs.push([counts, low | high << 16, (low ^ high) & 1, 0xA55A_5AA5]);
+                }
+            }
+        }
+    }
+    let mut seed = 0x9876_5432u32;
+    for _ in 0..4096 {
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed
+        };
+        inputs.push([next(), next(), next() & 1, next()]);
+    }
+    for dst in [1u8, 2, 5] {
+        for opsel in [0u8, 1, 2, 3, 8, 9, 10, 11] {
+            for guarded in [false, true] {
+                let mut body = Vec::new();
+                if guarded {
+                    // EXEC = lanes with a nonzero v3; retain it in s20.
+                    body.push(vopc(0xC5, int(0), 3)); // v_cmp_ne_u32 vcc, 0, v3
+                    body.push(sop1(0x3C, 20, VCC)); // s_and_saveexec_b32
+                }
+                body.extend(vop3(0x308, dst, [v(1), v(2), 0], M { opsel, ..NONE }));
+                if guarded {
+                    body.push(sop1(0x03, 126, s(20))); // restore EXEC
+                }
+                if dst != 5 {
+                    body.push(vop1(0x01, 5, v(dst)));
+                }
+                probes.push(probe(body, inputs.clone(), INT, move |i| {
+                    model(i, dst, opsel, guarded)
+                }));
+            }
+        }
+    }
+    assert_clean(check(&probes));
+}
+
 // ---- lanes ----
 
 /// Masked lanes keep their registers: `s_and_saveexec_b32` narrowing to the

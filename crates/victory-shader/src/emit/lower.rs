@@ -60,6 +60,9 @@ pub(crate) struct Lowered {
     /// Heap handles written.
     #[cfg(test)]
     pub heap_handles: u32,
+    /// Instructions written to the DXIL function body.
+    #[cfg(test)]
+    pub instructions: usize,
     /// Whether the program uses wave operations.
     #[cfg(test)]
     pub wave_ops: bool,
@@ -1404,6 +1407,8 @@ impl<'a> Lower<'a> {
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
             heap_handles: self.s.m.written_calls("dx.op.createHandleFromHeap") as u32,
+            #[cfg(test)]
+            instructions: self.s.m.written_instructions(),
             #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
             #[cfg(test)]
@@ -7131,7 +7136,9 @@ impl<'a> Lower<'a> {
                     let t = l.s.m.bin(c, Bin::Shl, x, k16);
                     l.s.m.bin(c, Bin::AShr, t, k16)
                 };
-                if name.ends_with("_i16") {
+                // The arithmetic shift arm extends its value once; only the
+                // count's low four bits are used, so it needs no extension.
+                if name.ends_with("_i16") && name != "v_ashrrev_i16" {
                     a = sext(self, a);
                     b = sext(self, b);
                 }
@@ -11089,6 +11096,32 @@ mod tests {
 
     fn lowers_valu(body: &[u32]) -> Result<(), crate::ShaderError> {
         lower_valu(body).map(|_| ())
+    }
+
+    #[test]
+    fn i16_right_shift_sign_extends_only_the_value() {
+        // Both programs read a dynamic count/value, preserve the destination's
+        // other half, and store the result. Arithmetic right shift needs only
+        // the two instructions that sign-extend its value before shifting.
+        let mut counts = Vec::new();
+        for opsel in [0u32, 1, 2, 3, 8, 9, 10, 11] {
+            let count = |op: u32| {
+                lower_valu(&[
+                    0x7E00_0303, // v_mov_b32 v0, v3: old destination
+                    0xD400_0000 | op << 16 | opsel << 11,
+                    0x101 | 0x102 << 9,
+                ])
+                .unwrap()
+                .instructions
+            };
+            let logical = count(0x307u32);
+            let arithmetic = count(0x308u32);
+            counts.push((logical, arithmetic));
+        }
+        eprintln!("logical/arithmetic i16 right shifts: {counts:?} written DXIL instructions");
+        for (logical, arithmetic) in counts {
+            assert_eq!(arithmetic, logical + 2);
+        }
     }
 
     #[test]
