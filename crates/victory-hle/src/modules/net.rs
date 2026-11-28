@@ -19,9 +19,10 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 #![allow(clippy::too_many_arguments)]
 
+use std::collections::HashSet;
 use std::ffi::{CStr, c_char, c_void};
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Mutex;
+use std::sync::{LazyLock, Mutex};
 
 use windows_sys::Win32::Foundation::SetLastError;
 
@@ -66,14 +67,28 @@ const WSAID_WSASENDMSG: Guid = Guid(
 type Socket = usize;
 type Handle = *mut c_void;
 
-/// Logs `what` for `destination` the first time (no payload, ever).
+/// Logs the first 1024 distinct `(what, destination)` pairs once (no
+/// payload, ever). Further pairs stay silent so the history stays bounded.
 fn once(what: &'static str, destination: String) {
-    static SEEN: Mutex<Vec<(&str, String)>> = Mutex::new(Vec::new());
-    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
-    if !seen.iter().any(|(w, d)| *w == what && *d == destination) {
+    static SEEN: LazyLock<Mutex<HashSet<(&str, String)>>> =
+        LazyLock::new(|| Mutex::new(HashSet::new()));
+    let first = {
+        let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        remember(&mut seen, what, &destination)
+    };
+    if first {
         tracing::info!(%destination, "{what}");
-        seen.push((what, destination));
     }
+}
+
+const MAX_BLOCKED_LOGS: usize = 1024;
+
+fn remember(
+    seen: &mut HashSet<(&'static str, String)>,
+    what: &'static str,
+    destination: &str,
+) -> bool {
+    seen.len() < MAX_BLOCKED_LOGS && seen.insert((what, destination.to_owned()))
 }
 
 fn wsa_error(code: i32) {
@@ -890,6 +905,30 @@ pub(crate) fn module() -> HleModule {
 mod tests {
     use super::*;
     use victory_pe::ImportSymbol;
+
+    #[test]
+    fn blocked_log_history_stops_at_its_limit() {
+        let mut seen = Default::default();
+        assert!(super::remember(&mut seen, "connect", "192.0.2.1:80"));
+        assert!(!super::remember(&mut seen, "connect", "192.0.2.1:80"));
+        assert!(super::remember(&mut seen, "sendto", "192.0.2.1:80"));
+        for i in 2..super::MAX_BLOCKED_LOGS {
+            assert!(super::remember(
+                &mut seen,
+                "connect",
+                &format!("host-{i}.invalid")
+            ));
+        }
+        for i in 0..super::MAX_BLOCKED_LOGS {
+            assert!(!super::remember(
+                &mut seen,
+                "connect",
+                &format!("overflow-{i}.invalid")
+            ));
+        }
+        assert!(!super::remember(&mut seen, "connect", "192.0.2.1:80"));
+        assert_eq!(seen.len(), super::MAX_BLOCKED_LOGS);
+    }
 
     fn v4(ip: [u8; 4], port: u16) -> [u8; 16] {
         let mut a = [0u8; 16];
