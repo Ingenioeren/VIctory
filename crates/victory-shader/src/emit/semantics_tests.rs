@@ -2814,6 +2814,153 @@ fn scalar_alu_matches_the_hardware() {
     assert_clean(check(&passing(scalar_probes())));
 }
 
+/// Half selection is an unsigned word read, even if bit 31 of the dword
+/// is set. Compare both paths with byte-array word extraction.
+#[test]
+fn high_half_integer_reads_match_word_selection() {
+    let word = |x: u32, high: bool| {
+        let b = x.to_le_bytes();
+        let at = usize::from(high) * 2;
+        u16::from_le_bytes([b[at], b[at + 1]])
+    };
+    let inputs: Vec<_> = (0..=u16::MAX)
+        .map(|x| {
+            let a = u32::from(x) << 16 | u32::from(!x);
+            [
+                a,
+                a.rotate_left(7) ^ 0x8000_FFFF,
+                a.rotate_right(9),
+                0xA55A_5AA5,
+            ]
+        })
+        .collect();
+    let mut probes = vec![probe(
+        vop3(0x303, 5, [v(1), v(2), 0], M { opsel: 11, ..NONE }),
+        inputs.clone(),
+        INT,
+        move |i| {
+            vec![(i[3] & 0xFFFF) | u32::from(word(i[0], true).wrapping_add(word(i[1], true))) << 16]
+        },
+    )];
+    let sample: Vec<_> = inputs.iter().step_by(17).copied().collect();
+    for dst in [1u8, 2, 5] {
+        for sel in [0u8, 1, 2, 3, 8, 9, 10, 11] {
+            for guarded in [false, true] {
+                let mut body = Vec::new();
+                if guarded {
+                    body.push(vopc(0xC4, v(1), 2)); // v_cmp_gt_u32 vcc, v1, v2
+                    body.push(sop1(0x3C, 20, VCC));
+                }
+                body.extend(vop3(0x303, dst, [v(1), v(2), 0], M { opsel: sel, ..NONE }));
+                if guarded {
+                    body.push(sop1(0x03, 126, s(20)));
+                }
+                if dst != 5 {
+                    body.push(vop1(0x01, 5, v(dst)));
+                }
+                probes.push(probe(body, sample.clone(), INT, move |i| {
+                    let old = match dst {
+                        1 => i[0],
+                        2 => i[1],
+                        _ => i[3],
+                    };
+                    if guarded && i[0] <= i[1] {
+                        return vec![old];
+                    }
+                    let sum = word(i[0], sel & 1 != 0).wrapping_add(word(i[1], sel & 2 != 0));
+                    let at = u32::from(sel >> 3) * 16;
+                    vec![(old & !(0xFFFF << at)) | u32::from(sum) << at]
+                }));
+            }
+        }
+    }
+    // Select the two output words independently, including repeated high
+    // reads and low/high swaps, with three dynamic packed MAD operands.
+    for lo in 0..8u8 {
+        for hi in 0..8u8 {
+            probes.push(probe(
+                vop3p(0x09, 5, [v(1), v(2), v(3)], lo, hi, [0, 0]),
+                sample.clone(),
+                INT,
+                move |i| {
+                    let mad = |sel: u8| {
+                        u32::from(
+                            word(i[0], sel & 1 != 0)
+                                .wrapping_mul(word(i[1], sel & 2 != 0))
+                                .wrapping_add(word(i[2], sel & 4 != 0)),
+                        )
+                    };
+                    vec![mad(lo) | mad(hi) << 16]
+                },
+            ));
+        }
+    }
+    assert_clean(check(&probes));
+}
+
+/// Floating reads share the same word extraction. Small multiples of 0.5
+/// keep the products and sums exact in f32, avoiding double rounding.
+#[test]
+fn high_half_float_reads_keep_their_halves() {
+    let values = [-32.0f64, -1.0, 0.0, 0.5, 1.0, 16.0, 32.0];
+    let inputs: Vec<_> = (0..256usize)
+        .map(|n| {
+            let pair = |offset: usize| {
+                to_f16(values[(n + offset) % values.len()], false)
+                    | to_f16(values[(n / values.len() + offset) % values.len()], false) << 16
+            };
+            [pair(0), pair(1), pair(2), pair(3)]
+        })
+        .collect();
+    let mut probes = Vec::new();
+    for opsel in 0..16u8 {
+        probes.push(probe(
+            vop3(0x34B, 5, [v(1), v(2), v(3)], M { opsel, ..NONE }),
+            inputs.clone(),
+            INT,
+            move |i| {
+                let source = |k: usize| h(i[k] >> (16 * u32::from(opsel >> k & 1)));
+                let result = to_f16(source(0).mul_add(source(1), source(2)), false);
+                let at = 16 * u32::from(opsel >> 3);
+                vec![(i[3] & !(0xFFFF << at)) | result << at]
+            },
+        ));
+    }
+    for lo in 0..4u8 {
+        for hi in 0..4u8 {
+            for neg in [[0, 0], [1, 2], [3, 3]] {
+                probes.push(probe(
+                    vop3p(0x0F, 5, [v(1), v(2), 0], lo, hi, neg),
+                    inputs.clone(),
+                    INT,
+                    move |i| {
+                        let sum = |sel: u8, neg: u8| {
+                            let a = h(i[0] >> (16 * u32::from(sel & 1 != 0)));
+                            let b = h(i[1] >> (16 * u32::from(sel & 2 != 0)));
+                            to_f16(
+                                (if neg & 1 != 0 { -a } else { a })
+                                    + (if neg & 2 != 0 { -b } else { b }),
+                                false,
+                            )
+                        };
+                        vec![sum(lo, neg[0]) | sum(hi, neg[1]) << 16]
+                    },
+                ));
+            }
+        }
+    }
+    // The implicit accumulator is the destination, with both halves live.
+    probes.push(probe([vop2(0x3C, 5, v(1), 2)], inputs, INT, |i| {
+        let sum = |shift| {
+            to_f16(
+                h(i[0] >> shift).mul_add(h(i[1] >> shift), h(i[3] >> shift)),
+                false,
+            )
+        };
+        vec![sum(0) | sum(16) << 16]
+    }));
+    assert_clean(check(&probes));
+}
 // ---- lanes ----
 
 /// Masked lanes keep their registers: `s_and_saveexec_b32` narrowing to the

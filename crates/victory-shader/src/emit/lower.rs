@@ -60,6 +60,9 @@ pub(crate) struct Lowered {
     /// Heap handles written.
     #[cfg(test)]
     pub heap_handles: u32,
+    /// Instructions, including terminators, in the written function body.
+    #[cfg(test)]
+    pub instructions: usize,
     /// Whether the program uses wave operations.
     #[cfg(test)]
     pub wave_ops: bool,
@@ -1404,6 +1407,8 @@ impl<'a> Lower<'a> {
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
             heap_handles: self.s.m.written_calls("dx.op.createHandleFromHeap") as u32,
+            #[cfg(test)]
+            instructions: self.s.m.written_instructions(),
             #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
             #[cfg(test)]
@@ -6824,14 +6829,13 @@ impl<'a> Lower<'a> {
             },
         };
         let c = self.cur;
-        let x = if high {
+        Ok(if high {
             let k16 = self.s.m.i32(16);
             self.s.m.bin(c, Bin::LShr, x, k16)
         } else {
-            x
-        };
-        let m = self.s.m.i32(0xFFFF);
-        Ok(self.s.m.bin(c, Bin::And, x, m))
+            let m = self.s.m.i32(0xFFFF);
+            self.s.m.bin(c, Bin::And, x, m)
+        })
     }
 
     /// An f16 source as an f32 (exact), with its abs/neg modifiers.
@@ -7260,14 +7264,13 @@ impl<'a> Lower<'a> {
             self.operand(inst, &op)?
         };
         let c = self.cur;
-        let x = if sel {
+        Ok(if sel {
             let k16 = self.s.m.i32(16);
             self.s.m.bin(c, Bin::LShr, x, k16)
         } else {
-            x
-        };
-        let m = self.s.m.i32(0xFFFF);
-        Ok(self.s.m.bin(c, Bin::And, x, m))
+            let m = self.s.m.i32(0xFFFF);
+            self.s.m.bin(c, Bin::And, x, m)
+        })
     }
 
     /// Half `high` of source `k` of `v_pk_fmac_f16`, in the low 16 bits: a
@@ -7284,14 +7287,13 @@ impl<'a> Lower<'a> {
         }
         let x = self.operand(inst, &op)?;
         let c = self.cur;
-        let x = if high {
+        Ok(if high {
             let k16 = self.s.m.i32(16);
             self.s.m.bin(c, Bin::LShr, x, k16)
         } else {
-            x
-        };
-        let m = self.s.m.i32(0xFFFF);
-        Ok(self.s.m.bin(c, Bin::And, x, m))
+            let m = self.s.m.i32(0xFFFF);
+            self.s.m.bin(c, Bin::And, x, m)
+        })
     }
 
     /// Packed 16-bit operations (`v_pk_*`): each half computed as the
@@ -11089,6 +11091,53 @@ mod tests {
 
     fn lowers_valu(body: &[u32]) -> Result<(), crate::ShaderError> {
         lower_valu(body).map(|_| ())
+    }
+
+    #[test]
+    fn high_half_reads_need_no_mask_after_the_shift() {
+        // Each source selection costs one instruction: low halves need an
+        // AND, high halves only a logical shift. All operands are dynamic.
+        let mut rows = Vec::new();
+        for (op, selections) in [(0x303u32, 4), (0x34B, 8)] {
+            // v_add_nc_u16, v_fma_f16
+            let counts: Vec<_> = (0..selections)
+                .map(|sel| {
+                    lower_valu(&[
+                        0xD400_0000 | op << 16 | sel << 11,
+                        0x101 | 0x102 << 9 | 0x103 << 18,
+                    ])
+                    .unwrap()
+                    .instructions
+                })
+                .collect();
+            eprintln!("VOP3 {op:#x}: {counts:?} written instructions");
+            rows.push(counts);
+        }
+        for op in [0x009u32, 0x00F] {
+            // v_pk_mad_u16, v_pk_add_f16
+            let counts: Vec<_> = (0..8)
+                .map(|sel| {
+                    lower_valu(&[
+                        0xCC00_0000 | op << 16 | (sel >> 2 & 1) << 14 | sel << 11,
+                        (sel & 3) << 27 | 0x101 | 0x102 << 9 | 0x103 << 18,
+                    ])
+                    .unwrap()
+                    .instructions
+                })
+                .collect();
+            eprintln!("VOP3P {op:#x}: {counts:?} written instructions");
+            rows.push(counts);
+        }
+        // v_pk_fmac_f16 has fixed low/high sources, including its accumulator.
+        let fmac = lower_valu(&[0x7E00_0303, 0x7800_0501]).unwrap();
+        eprintln!(
+            "VOP2 v_pk_fmac_f16: {} written instructions",
+            fmac.instructions
+        );
+        assert_eq!(fmac.instructions, 122);
+        for counts in rows {
+            assert!(counts.iter().all(|&n| n == counts[0]), "{counts:?}");
+        }
     }
 
     #[test]
